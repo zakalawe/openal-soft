@@ -63,6 +63,30 @@ DECLARE_DEFAULT_ALLOCATORS(ALCcoreAudioPlayback)
 
 DEFINE_ALCBACKEND_VTABLE(ALCcoreAudioPlayback);
 
+static void ALCcoreAudio_TranslateUIDToDeviceId(const char* ca_device_uid, AudioDeviceID* device)
+{
+    AudioObjectPropertyAddress property = {
+        kAudioHardwarePropertyTranslateUIDToDevice,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMaster
+    };
+
+    CFStringRef deviceUID = CFStringCreateWithCString(CFAllocatorGetDefault(), ca_device_uid,
+                                                      kCFStringEncodingUTF8);
+    UInt32 dataSize = sizeof(AudioDeviceID);
+    OSStatus status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &property,
+                                        sizeof(CFStringRef), &deviceUID,
+                                        &dataSize, device);
+
+    CFRelease(deviceUID);
+    if (kAudioHardwareNoError != status)
+    {
+        fprintf(stderr, "ALCcoreAudio_TranslateUIDToDeviceId failed: %i\n", status);
+        return;
+    }
+
+    printf("Translated UID to AudioDeviceID ok!");
+}
 
 static void ALCcoreAudioPlayback_Construct(ALCcoreAudioPlayback *self, ALCdevice *device)
 {
@@ -104,11 +128,10 @@ static ALCenum ALCcoreAudioPlayback_open(ALCcoreAudioPlayback *self, const ALCch
     AudioComponentDescription desc;
     AudioComponent comp;
     OSStatus err;
+    AudioDeviceID deviceID;
 
     if(!name)
         name = ca_device;
-    else if(strcmp(name, ca_device) != 0)
-        return ALC_INVALID_VALUE;
 
     /* open the default output unit */
     desc.componentType = kAudioUnitType_Output;
@@ -129,6 +152,19 @@ static ALCenum ALCcoreAudioPlayback_open(ALCcoreAudioPlayback *self, const ALCch
     {
         ERR("AudioComponentInstanceNew failed\n");
         return ALC_INVALID_VALUE;
+    }
+
+    if (strcmp(name, ca_device) != 0) {
+        printf("Setting specific output device: %s\n", name);
+        ALCcoreAudio_TranslateUIDToDeviceId(name, &deviceID);
+        // Track the requested output  device
+        err = AudioUnitSetProperty(self->audioUnit, kAudioOutputUnitProperty_CurrentDevice,
+                                   kAudioUnitScope_Global, 0, &deviceID, sizeof(AudioDeviceID));
+        if(err != noErr)
+        {
+            ERR("AudioUnitSetProperty : currentDevice failed\n");
+            return ALC_INVALID_VALUE;
+        }
     }
 
     /* init and start the default audio unit... */
@@ -461,8 +497,6 @@ static ALCenum ALCcoreAudioCapture_open(ALCcoreAudioCapture *self, const ALCchar
 
     if(!name)
         name = ca_device;
-    else if(strcmp(name, ca_device) != 0)
-        return ALC_INVALID_VALUE;
 
     desc.componentType = kAudioUnitType_Output;
     desc.componentSubType = kAudioUnitSubType_HALOutput;
@@ -505,17 +539,24 @@ static ALCenum ALCcoreAudioCapture_open(ALCcoreAudioCapture *self, const ALCchar
     }
 
     // Get the default input device
-
-    propertySize = sizeof(AudioDeviceID);
-    propertyAddress.mSelector = kAudioHardwarePropertyDefaultInputDevice;
-    propertyAddress.mScope = kAudioObjectPropertyScopeGlobal;
-    propertyAddress.mElement = kAudioObjectPropertyElementMaster;
-
-    err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &propertySize, &inputDevice);
-    if(err != noErr)
+    if (strcmp(name, ca_device) == 0)
     {
-        ERR("AudioObjectGetPropertyData failed\n");
-        goto error;
+        propertySize = sizeof(AudioDeviceID);
+        propertyAddress.mSelector = kAudioHardwarePropertyDefaultInputDevice;
+        propertyAddress.mScope = kAudioObjectPropertyScopeGlobal;
+        propertyAddress.mElement = kAudioObjectPropertyElementMaster;
+
+        err = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &propertySize, &inputDevice);
+        if(err != noErr)
+        {
+            ERR("AudioObjectGetPropertyData failed\n");
+            goto error;
+        }
+    }
+    else
+    {
+        printf("Requested explicit input device: %s\n", name);
+        ALCcoreAudio_TranslateUIDToDeviceId(name, &inputDevice);
     }
 
     if(inputDevice == kAudioDeviceUnknown)
@@ -778,6 +819,7 @@ static ALCboolean ALCcoreAudioBackendFactory_querySupport(ALCcoreAudioBackendFac
 
 static void ALCcoreAudioBackendFactory_probe(ALCcoreAudioBackendFactory* UNUSED(self), enum DevProbe type)
 {
+    // first append the default device as normal
     switch(type)
     {
         case ALL_DEVICE_PROBE:
@@ -787,6 +829,114 @@ static void ALCcoreAudioBackendFactory_probe(ALCcoreAudioBackendFactory* UNUSED(
             AppendCaptureDeviceList(ca_device);
             break;
     }
+//////////////////////////////
+    AudioObjectPropertyAddress propertyAddress = { 
+        kAudioHardwarePropertyDevices, 
+        kAudioObjectPropertyScopeGlobal, 
+        kAudioObjectPropertyElementMaster 
+    };
+
+    UInt32 dataSize = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &dataSize);
+    if(kAudioHardwareNoError != status) {
+        fprintf(stderr, "AudioObjectGetPropertyDataSize (kAudioHardwarePropertyDevices) failed: %i\n", status);
+        return;
+    }
+
+    UInt32 deviceCount = (UInt32)(dataSize / sizeof(AudioDeviceID));
+    AudioDeviceID *audioDevices = (AudioDeviceID *) malloc(dataSize);
+    if(NULL == audioDevices) {
+        fputs("Unable to allocate memory", stderr);
+        return;
+    }
+
+    status = AudioObjectGetPropertyData(kAudioObjectSystemObject, &propertyAddress, 0, NULL, &dataSize, audioDevices);
+    if(kAudioHardwareNoError != status) {
+        fprintf(stderr, "AudioObjectGetPropertyData (kAudioHardwarePropertyDevices) failed: %i\n", status);
+        free(audioDevices), audioDevices = NULL;
+        return;
+    }
+
+    for(UInt32 i = 0; i < deviceCount; ++i) {
+        // Query device UID
+        CFStringRef deviceUID = NULL;
+        dataSize = sizeof(deviceUID);
+        propertyAddress.mSelector = kAudioDevicePropertyDeviceUID;
+        status = AudioObjectGetPropertyData(audioDevices[i], &propertyAddress, 0, NULL, &dataSize, &deviceUID);
+        if(kAudioHardwareNoError != status) {
+            fprintf(stderr, "AudioObjectGetPropertyData (kAudioDevicePropertyDeviceUID) failed: %i\n", status);
+            continue;
+        }
+
+        // Query device name
+        CFStringRef deviceName = NULL;
+        dataSize = sizeof(deviceName);
+        propertyAddress.mSelector = kAudioDevicePropertyDeviceNameCFString;
+        status = AudioObjectGetPropertyData(audioDevices[i], &propertyAddress, 0, NULL, &dataSize, &deviceName);
+        if(kAudioHardwareNoError != status) {
+            fprintf(stderr, "AudioObjectGetPropertyData (kAudioDevicePropertyDeviceNameCFString) failed: %i\n", status);
+            continue;
+        }
+
+        // Query device manufacturer
+        CFStringRef deviceManufacturer = NULL;
+        dataSize = sizeof(deviceManufacturer);
+        propertyAddress.mSelector = kAudioDevicePropertyDeviceManufacturerCFString;
+        status = AudioObjectGetPropertyData(audioDevices[i], &propertyAddress, 0, NULL, &dataSize, &deviceManufacturer);
+        if(kAudioHardwareNoError != status) {
+            fprintf(stderr, "AudioObjectGetPropertyData (kAudioDevicePropertyDeviceManufacturerCFString) failed: %i\n", status);
+            continue;
+        }
+
+//        printf("Device ID:%s is %s - %s\n", CFStringGetCStringPtr(deviceUID, kCFStringEncodingUTF8),
+//            CFStringGetCStringPtr(deviceName, kCFStringEncodingUTF8),
+//            CFStringGetCStringPtr(deviceManufacturer, kCFStringEncodingUTF8));
+
+        if (type == ALL_DEVICE_PROBE)
+        {
+            char* savedString = strdup(CFStringGetCStringPtr(deviceUID, kCFStringEncodingUTF8));
+            AppendAllDevicesList(savedString);
+            continue;
+        }
+
+
+        //////////////////////////////////
+
+         // Determine if the device is an input device (it is an input device if it has input channels)
+        dataSize = 0;
+        propertyAddress.mSelector = kAudioDevicePropertyStreamConfiguration;
+        propertyAddress.mScope = kAudioObjectPropertyScopeInput;
+        status = AudioObjectGetPropertyDataSize(audioDevices[i], &propertyAddress, 0, NULL, &dataSize);
+        if(kAudioHardwareNoError != status) {
+            fprintf(stderr, "AudioObjectGetPropertyDataSize (kAudioDevicePropertyStreamConfiguration) failed: %i\n", status);
+            continue;
+        }
+
+        AudioBufferList *bufferList = (AudioBufferList*) malloc(dataSize);
+        if (NULL == bufferList) {
+            fputs("Unable to allocate memory", stderr);
+            break;
+        }
+
+        status = AudioObjectGetPropertyData(audioDevices[i], &propertyAddress, 0, NULL, &dataSize, bufferList);
+        if(kAudioHardwareNoError != status || 0 == bufferList->mNumberBuffers) {
+            if(kAudioHardwareNoError != status)
+                fprintf(stderr, "AudioObjectGetPropertyData (kAudioDevicePropertyStreamConfiguration) failed: %i\n", status);
+            free(bufferList), bufferList = NULL;
+            continue;           
+        }
+
+    //    printf("\tnum buffers: %d\n", bufferList->mNumberBuffers);
+        if (bufferList->mNumberBuffers > 0) {
+            char* savedString = strdup(CFStringGetCStringPtr(deviceUID, kCFStringEncodingUTF8));
+            AppendCaptureDeviceList(savedString);
+        }
+
+        free(bufferList), bufferList = NULL;
+        
+    } // of device loop
+
+    free(audioDevices);
 }
 
 static ALCbackend* ALCcoreAudioBackendFactory_createBackend(ALCcoreAudioBackendFactory* UNUSED(self), ALCdevice *device, ALCbackend_Type type)
